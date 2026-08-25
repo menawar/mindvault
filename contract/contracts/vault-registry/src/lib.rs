@@ -30,6 +30,7 @@ const MAX_TAGS: u32 = 8;
 /// Maximum price in USDC stroops (6 decimals). Represents 1 trillion USDC.
 pub const MAX_PRICE: i128 = 1_000_000_000_000_000_000;
 const MAX_TAG_LEN: u32 = 32;
+const MAX_RECEIPT_ID_LEN: u32 = 64;
 /// Maximum number of items returned per page by `list`, `list_page`,
 /// `list_listed`, and `list_by_creator`. Centralised here so the cap is
 /// easy to find, document, and change in a single place instead of
@@ -220,6 +221,10 @@ pub const EVENT_SCHEMA: &[(&str, &str)] = &[
     ("reindex", "new_count: u32 (topic carries old_count: u32)"),
     (
         "payment",
+        "PaymentReceipt { receipt_id, resource_id, payer, amount, state, tx_hash, recorded_at }",
+    ),
+    (
+        "settle",
         "PaymentReceipt { receipt_id, resource_id, payer, amount, state, tx_hash, recorded_at }",
     ),
     (
@@ -417,7 +422,7 @@ pub enum DataKey {
     /// Most-recent payment receipt for `(resource_id, payer)`.
     /// Keyed by (resource id string, payer Address) so escrow/lease
     /// contracts can look up a settlement without scanning event history.
-    PaymentReceipt(String, Address),
+    PaymentReceipt(String),
     /// Immutable purchase receipt anchor for `(resource_id, buyer)`.
     PurchaseReceipt(String, Address),
     /// Secondary index mapping a normalized tag to ordered resource ids.
@@ -426,6 +431,7 @@ pub enum DataKey {
     FeeConfig,
     Moderator(Address),
     DisputeFlag(String),
+    Settler(Address),
 }
 
 /// Event data emitted when a resource's metadata pointer is updated.
@@ -586,6 +592,12 @@ pub enum Error {
     BatchTooLarge = 37,
     /// A purchase receipt already exists for `(resource_id, buyer)`.
     DuplicateReceipt = 38,
+    ContractPaused = 39,
+    InvalidPaymentTransition = 40,
+    InvalidReceiptId = 41,
+    ReceiptAlreadyExists = 42,
+    NotSettler = 43,
+    ContentHashTooLong = 44,
 }
 
 #[contract]
@@ -593,6 +605,10 @@ pub struct VaultRegistry;
 
 #[contractimpl]
 impl VaultRegistry {
+    fn require_not_paused(env: &Env) -> Result<(), Error> {
+        Ok(())
+    }
+
     /// Register a new resource. Price is in USDC stroops (6 decimals).
     /// Rejects `price <= 0` (`InvalidPrice`) or `price > MAX_PRICE` (`PriceExceedsMax`).
     /// Requires the creator's authorization.
@@ -624,8 +640,9 @@ impl VaultRegistry {
             id: id.clone(),
             creator: creator.clone(),
             price,
-            metadata,
+            metadata: metadata.clone(),
             listed: true,
+            state: ResourceState::Listed,
             tags: tags.clone(),
             verified: VerificationStatus::Pending,
             frozen: false,
@@ -667,6 +684,7 @@ impl VaultRegistry {
             metadata,
             listed: true,
             tags,
+            content_hash: None,
         };
         env.events().publish((symbol_short!("register"), id), event);
         Ok(())
@@ -801,6 +819,9 @@ impl VaultRegistry {
 
         // Capture previous tags before replacement for event emission and index
         let prev_tags = resource.tags.clone();
+
+        Self::tag_index_remove(&env, &prev_tags, &id);
+        Self::tag_index_add(&env, &norm_tags, &id);
 
         resource.tags = norm_tags.clone();
         Self::save(&env, &mut resource);
@@ -1022,12 +1043,13 @@ impl VaultRegistry {
             let idx_key = DataKey::Index(i);
             if let Some(id) = env.storage().persistent().get::<DataKey, String>(&idx_key) {
                 Self::bump_persistent(&env, &idx_key);
-                let res_key = DataKey::Resource(id);
+                let res_key = DataKey::Resource(id.clone());
                 if let Some(resource) = env
                     .storage()
                     .persistent()
                     .get::<DataKey, Resource>(&DataKey::Resource(id))
                 {
+                    Self::bump_persistent(&env, &res_key);
                     items.push_back(resource);
                 }
             }
@@ -1052,7 +1074,7 @@ impl VaultRegistry {
             let idx_key = DataKey::Index(i);
             if let Some(id) = env.storage().persistent().get::<DataKey, String>(&idx_key) {
                 Self::bump_persistent(&env, &idx_key);
-                let res_key = DataKey::Resource(id);
+                let res_key = DataKey::Resource(id.clone());
                 if let Some(resource) = env
                     .storage()
                     .persistent()
@@ -1752,6 +1774,21 @@ impl VaultRegistry {
         Ok(())
     }
 
+    /// Fetch a payment receipt by its unique `receipt_id`.
+    /// Errors with `NotFound` if it does not exist.
+    /// Bumps the entry's TTL on a successful read.
+    pub fn get_payment(env: Env, receipt_id: String) -> Result<PaymentReceipt, Error> {
+        Self::validate_receipt_id(&receipt_id)?;
+        let key = DataKey::PaymentReceipt(receipt_id);
+        let receipt = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::NotFound)?;
+        Self::bump_persistent(&env, &key);
+        Ok(receipt)
+    }
+
     /// Anchor a purchase receipt hash for `(resource_id, buyer)`.
     ///
     /// This is immutable: duplicate anchors for the same pair error with
@@ -1815,16 +1852,6 @@ impl VaultRegistry {
         Ok(anchor)
     }
 
-    /// Fetch a creator's marketplace terms hash. Errors with `NotFound` if it does not exist.
-    /// Bumps the entry's TTL on a successful read.
-    pub fn get_terms_hash(env: Env, creator: Address) -> Result<String, Error> {
-        let key = DataKey::CreatorTerms(creator);
-        let hash = env
-            .storage()
-            .persistent()
-            .get(&DataKey::PaymentReceipt(receipt_id))
-            .ok_or(Error::NotFound)
-    }
 
     // ─── Moderator role management (#389) ────────────────────────────────────
 
@@ -2175,7 +2202,6 @@ impl VaultRegistry {
     }
 
     fn save(env: &Env, resource: &mut Resource) {
-        resource.version = resource.version.checked_add(1).unwrap_or(resource.version);
         resource.updated_at = env.ledger().sequence();
         let key = DataKey::Resource(resource.id.clone());
         env.storage().persistent().set(&key, resource as &Resource);
@@ -2386,14 +2412,14 @@ impl VaultRegistry {
             price,
             metadata: metadata.clone(),
             listed: true,
+            state: ResourceState::Listed,
             tags: norm_tags.clone(),
             verified: VerificationStatus::Pending,
             frozen: false,
+            created_at: env.ledger().sequence(),
             updated_at: env.ledger().sequence(),
             dispute_flag: DisputeFlag::NoFlag,
             schema_version: RESOURCE_SCHEMA_VERSION,
-            version: 1,
-            content_hash: content_hash.clone(),
         };
         env.storage().persistent().set(&key, &resource);
         Self::bump_persistent(&env, &key);

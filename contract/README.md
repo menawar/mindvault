@@ -285,7 +285,8 @@ apart, so update all three together.
 | `addverif`  | `true`                                                             | `add_verifier()` succeeds                                  |
 | `rmverif`   | `false`                                                            | `remove_verifier()` succeeds                               |
 | `reindex`   | `new_count: u32 (topic carries old_count: u32)`                    | `repair_index()` succeeds                                  |
-| `payrec`    | `PaymentReceipt { resource_id, payer, tx_hash, amount, ledger }`   | `record_payment()` succeeds                                |
+| `payment`   | `PaymentReceipt { receipt_id, resource_id, payer, amount, state, tx_hash, recorded_at }` | `record_payment()` succeeds                                |
+| `settle`    | `PaymentReceipt { receipt_id, resource_id, payer, amount, state, tx_hash, recorded_at }` | `settle_payment()` succeeds                                |
 | `anchor`    | `PurchaseReceiptAnchor { resource_id, buyer, receipt_hash, ledger }` | `anchor_purchase_receipt()` succeeds                        |
 | `addmod`    | `true`                                                             | `add_moderator()` succeeds                                 |
 | `rmmod`     | `false`                                                            | `remove_moderator()` succeeds                              |
